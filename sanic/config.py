@@ -57,6 +57,7 @@ DEFAULT_CONFIG = {
     "NO_COLOR": False,
     "NOISY_EXCEPTIONS": False,
     "PROXIES_COUNT": None,
+    "PROXY_PROTOCOL": False,
     "REAL_IP_HEADER": None,
     "REQUEST_BUFFER_SIZE": 65536,
     "REQUEST_MAX_HEADER_SIZE": 8192,  # Cannot exceed 16384
@@ -162,6 +163,7 @@ class Config(dict, metaclass=DescriptorMeta):
     NO_COLOR: bool
     NOISY_EXCEPTIONS: bool
     PROXIES_COUNT: int | None
+    PROXY_PROTOCOL: bool
     REAL_IP_HEADER: str | None
     REQUEST_BUFFER_SIZE: int
     REQUEST_MAX_HEADER_SIZE: int

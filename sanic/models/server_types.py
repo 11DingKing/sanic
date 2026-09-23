@@ -32,14 +32,25 @@ class ConnInfo:
         "network_paths",
     )
 
-    def __init__(self, transport: TransportProtocol, unix=None):
+    def __init__(
+        self,
+        transport: TransportProtocol,
+        unix=None,
+        *,
+        peername: tuple | None = None,
+        sockname: tuple | str | None = None,
+    ):
         self.ctx = SimpleNamespace()
         self.lost = False
         self.peername: tuple[str, int] | None = None
         self.server = self.client = ""
         self.server_port = self.client_port = 0
         self.client_ip = ""
-        self.sockname = addr = transport.get_extra_info("sockname")
+        self.sockname = addr = (
+            sockname
+            if sockname is not None
+            else transport.get_extra_info("sockname")
+        )
         self.ssl = False
         self.server_name = ""
         self.cert: dict[str, Any] = {}
@@ -62,10 +73,15 @@ class ConnInfo:
             # self.server gets non-standard port appended
             if addr[1] != (443 if self.ssl else 80):
                 self.server = f"{self.server}:{addr[1]}"
-        self.peername = addr = transport.get_extra_info("peername")
-        self.network_paths = transport.get_extra_info("network_paths")  # type: ignore
+        self.peername = peername
+        if self.peername is None:
+            self.peername = transport.get_extra_info("peername")
+            self.network_paths = transport.get_extra_info(
+                "network_paths"
+            )
 
-        if isinstance(addr, tuple):
+        if isinstance(self.peername, tuple):
+            addr = self.peername
             self.client = addr[0] if len(addr) == 2 else f"[{addr[0]}]"
             self.client_ip = addr[0]
             self.client_port = addr[1]

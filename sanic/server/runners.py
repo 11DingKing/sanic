@@ -28,6 +28,7 @@ from sanic.logging.setup import setup_logging
 from sanic.models.server_types import Signal
 from sanic.server.async_server import AsyncioServer
 from sanic.server.protocols.http_protocol import Http3Protocol, HttpProtocol
+from sanic.server.protocols.proxy_protocol import ProxyProtocol
 from sanic.server.socket import bind_unix_socket, remove_unix_socket
 
 
@@ -270,11 +271,45 @@ def _serve_http_1(
     # UNIX sockets are always bound by us (to preserve semantics between modes)
     elif unix:
         sock = bind_unix_socket(unix, backlog=backlog)
+
+    if app.config.PROXY_PROTOCOL:
+        if unix:
+            raise ServerError(
+                "PROXY protocol v2 cannot be enabled on a UNIX socket "
+                "listener."
+            )
+
+        def inner_factory(
+            *,
+            peername_override=None,
+            sockname_override=None,
+        ) -> asyncio.Protocol:
+            return server(
+                peername_override=peername_override,
+                sockname_override=sockname_override,
+            )
+
+        # The raw listener must not perform TLS itself: the PROXY header
+        # precedes the TLS ClientHello and has to be consumed in the clear.
+        # ProxyProtocol starts TLS manually once the header is validated.
+        protocol_factory = partial(
+            ProxyProtocol,
+            loop=loop,
+            app=app,
+            connections=connections,
+            inner_factory=inner_factory,
+            ssl_context=ssl,
+        )
+        server_ssl = None
+    else:
+        protocol_factory = server
+        server_ssl = ssl
+
     server_coroutine = loop.create_server(
-        server,
+        protocol_factory,
         None if sock else host,
         None if sock else port,
-        ssl=ssl,
+        ssl=server_ssl,
         reuse_port=reuse_port,
         sock=sock,
         backlog=backlog,

@@ -31,6 +31,8 @@ class SanicProtocol(asyncio.Protocol):
         "_task",
         "_unix",
         "_data_received",
+        "_peername_override",
+        "_sockname_override",
     )
 
     def __init__(
@@ -41,6 +43,8 @@ class SanicProtocol(asyncio.Protocol):
         signal=None,
         connections=None,
         unix=None,
+        peername_override=None,
+        sockname_override=None,
         **kwargs,
     ):
         asyncio.set_event_loop(loop)
@@ -56,6 +60,8 @@ class SanicProtocol(asyncio.Protocol):
         self._time = 0.0  # type: float
         self._task: asyncio.Task | None = None
         self._data_received = asyncio.Event()
+        self._peername_override = peername_override
+        self._sockname_override = sockname_override
 
     @property
     def ctx(self):
@@ -148,7 +154,12 @@ class SanicProtocol(asyncio.Protocol):
             transport.set_write_buffer_limits(low=16384, high=65536)
             self.connections.add(self)
             self.transport = transport
-            self.conn_info = ConnInfo(self.transport, unix=self._unix)
+            self.conn_info = ConnInfo(
+                self.transport,
+                unix=self._unix,
+                peername=self._peername_override,
+                sockname=self._sockname_override,
+            )
         except Exception:
             error_logger.exception("protocol.connect_made")
 

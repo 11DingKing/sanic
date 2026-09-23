@@ -128,6 +128,8 @@ class HttpProtocol(HttpProtocolMixin, SanicProtocol, metaclass=TouchUpMeta):
         connections=None,
         state=None,
         unix=None,
+        peername_override=None,
+        sockname_override=None,
         **kwargs,
     ):
         super().__init__(
@@ -136,6 +138,8 @@ class HttpProtocol(HttpProtocolMixin, SanicProtocol, metaclass=TouchUpMeta):
             signal=signal,
             connections=connections,
             unix=unix,
+            peername_override=peername_override,
+            sockname_override=sockname_override,
         )
         self.url = None
         self.state = state if state else {}
@@ -301,7 +305,12 @@ class HttpProtocol(HttpProtocolMixin, SanicProtocol, metaclass=TouchUpMeta):
             self.transport = transport
             self._task = self.loop.create_task(self.connection_task())
             self.recv_buffer = bytearray()
-            self.conn_info = ConnInfo(self.transport, unix=self._unix)
+            self.conn_info = ConnInfo(
+                self.transport,
+                unix=self._unix,
+                peername=self._peername_override,
+                sockname=self._sockname_override,
+            )
         except Exception:
             error_logger.exception("protocol.connect_made")
 

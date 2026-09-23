@@ -1,0 +1,25 @@
+rubrics:
+  - id: 1
+    type: f2p
+    text: "监听端口可选择启用 PROXY v2 接收模式，未启用时不读取 PROXY 前导且原有连接行为保持不变。"
+  - id: 2
+    type: f2p
+    text: "启用后分片到达的 PROXY v2 前导会等待完整验证，在验证完成前不会进入 HTTP、WebSocket 或 TLS 请求处理。"
+  - id: 3
+    type: f2p
+    text: "有效的 PROXY 命令会让请求可观察到前导中的源地址和目标地址，LOCAL 命令会保留底层连接地址。"
+  - id: 4
+    type: f2p
+    text: "前导之后已经到达的字节会无损交给现有 HTTP、WebSocket 或 TLS 流程，正常请求仍能完成。"
+  - id: 5
+    type: f2p
+    text: "畸形、超长、地址族或传输协议不匹配的前导，以及连接关闭前未收全的前导，都会在请求处理前终止连接。"
+  - id: 6
+    type: f2p
+    text: "一个连接的无效或未完成前导被终止后，同一 worker 接受的后续连接仍可独立完成正常请求。"
+  - id: 7
+    type: f2p
+    text: "多 worker 启动、扩缩容和重启后的监听连接都使用相同的 PROXY v2 配置。"
+  - id: 8
+    type: p2p
+    text: "启用 PROXY v2 模式时，现有 Forwarded 和 X-Forwarded-For 头处理仍保持原有语义。"

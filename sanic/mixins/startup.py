@@ -651,6 +651,10 @@ class StartupMixin(metaclass=SanicMeta):
                 "https://sanic.readthedocs.io/en/latest/sanic/config.html"
                 "#proxy-configuration"
             )
+        if self.config.PROXY_PROTOCOL and unix:
+            raise ServerError(
+                "PROXY_PROTOCOL cannot be enabled on a UNIX socket listener."
+            )
 
         if not self.state.is_debug:
             self.state.mode = Mode.DEBUG if debug else Mode.PRODUCTION
