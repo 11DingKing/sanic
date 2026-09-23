@@ -12,8 +12,13 @@ from pytest import MonkeyPatch
 
 from sanic import Sanic
 from sanic.application.state import Mode
-from sanic.asgi import Lifespan, MockTransport
-from sanic.exceptions import BadRequest, Forbidden, ServiceUnavailable
+from sanic.asgi import ASGIApp, Lifespan, MockTransport
+from sanic.exceptions import (
+    BadRequest,
+    Forbidden,
+    RequestCancelled,
+    ServiceUnavailable,
+)
 from sanic.request import Request
 from sanic.response import json, text
 from sanic.server.websockets.connection import WebSocketConnection
@@ -674,3 +679,278 @@ async def test_asgi_url_decoding(app):
 
     _, response = await app.asgi_client.get("/dir/some%F0%9F%98%80path")
     assert response.text == "some😀path"
+
+
+def _asgi_scope(method="GET", path="/"):
+    return {
+        "type": "http",
+        "asgi": {"spec_version": "2.3", "version": "3.0"},
+        "http_version": "1.1",
+        "method": method,
+        "raw_path": path.encode(),
+        "query_string": b"",
+        "path": path,
+        "headers": [(b"host", b"mockserver")],
+        "client": ("127.0.0.1", 1234),
+        "server": ("mockserver.local", 80),
+        "scheme": "http",
+    }
+
+
+async def _invoke(app, receive, send, *, method="GET", path="/"):
+    app.asgi = True
+    await app._startup()
+    asgi_app = await ASGIApp.create(
+        app, _asgi_scope(method, path), receive, send
+    )
+    await asgi_app()
+    return asgi_app
+
+
+@pytest.mark.asyncio
+async def test_asgi_disconnect_while_reading_body(app):
+    # The client disconnects before the full request body arrived.
+    # The framework preloads the body for non-streaming handlers, so
+    # the handler never runs and no mismatched response is written.
+    @app.post("/")
+    async def handler(request):
+        return text("should not be sent")
+
+    sent_messages = []
+    disconnect_ready = asyncio.Event()
+
+    @app.signal("http.routing.after")
+    def _release_disconnect(**_):
+        disconnect_ready.set()
+
+    call_count = 0
+
+    async def receive():
+        nonlocal call_count
+        call_count += 1
+        if call_count == 1:
+            return {
+                "type": "http.request",
+                "body": b"abc",
+                "more_body": True,
+            }
+        await disconnect_ready.wait()
+        return {"type": "http.disconnect"}
+
+    async def send(message):
+        sent_messages.append(message)
+
+    await _invoke(app, receive, send, method="POST")
+
+    assert sent_messages == []
+
+
+@pytest.mark.asyncio
+async def test_asgi_disconnect_cancels_busy_handler(app):
+    # Body fully received, then the client disconnects while the handler
+    # is still doing work. The handler must be cancelled and no response
+    # may be written.
+    state = {}
+    release = asyncio.Event()
+
+    @app.post("/")
+    async def handler(request):
+        await request.receive_body()
+        release.set()
+        try:
+            await asyncio.sleep(10)
+        except asyncio.CancelledError:
+            state["cancelled"] = True
+            raise
+        return text("should not be sent")
+
+    call_count = 0
+
+    async def receive():
+        nonlocal call_count
+        call_count += 1
+        if call_count == 1:
+            return {
+                "type": "http.request",
+                "body": b"",
+                "more_body": False,
+            }
+        await release.wait()
+        return {"type": "http.disconnect"}
+
+    sent_messages = []
+
+    async def send(message):
+        sent_messages.append(message)
+
+    await _invoke(app, receive, send, method="POST")
+
+    assert state.get("cancelled") is True
+    assert sent_messages == []
+
+
+@pytest.mark.asyncio
+async def test_asgi_streaming_body_disconnect_raises(app):
+    # A handler consuming the request stream must receive a clear
+    # RequestCancelled failure when the client disappears mid-stream.
+    state = {"chunks": []}
+    release = asyncio.Event()
+
+    @app.post("/", stream=True)
+    async def handler(request):
+        try:
+            async for chunk in request.stream:
+                state["chunks"].append(chunk)
+                release.set()
+        except RequestCancelled:
+            state["cancelled"] = True
+            raise
+        return text("should not be sent")
+
+    call_count = 0
+
+    async def receive():
+        nonlocal call_count
+        call_count += 1
+        if call_count == 1:
+            return {
+                "type": "http.request",
+                "body": b"abc",
+                "more_body": True,
+            }
+        await release.wait()
+        return {"type": "http.disconnect"}
+
+    sent_messages = []
+
+    async def send(message):
+        sent_messages.append(message)
+
+    await _invoke(app, receive, send, method="POST")
+
+    assert state["chunks"] == [b"abc"]
+    assert state.get("cancelled") is True
+    assert sent_messages == []
+
+
+@pytest.mark.asyncio
+async def test_asgi_handler_cannot_respond_after_disconnect(app):
+    # Even if the handler swallows the cancellation and tries to return
+    # a response anyway, the shared termination state blocks the write.
+    state = {}
+    release = asyncio.Event()
+
+    @app.post("/")
+    async def handler(request):
+        await request.receive_body()
+        release.set()
+        try:
+            await asyncio.sleep(10)
+        except asyncio.CancelledError:
+            state["cancelled"] = True
+            return text("should not be sent")
+        return text("ok")
+
+    call_count = 0
+
+    async def receive():
+        nonlocal call_count
+        call_count += 1
+        if call_count == 1:
+            return {
+                "type": "http.request",
+                "body": b"",
+                "more_body": False,
+            }
+        await release.wait()
+        return {"type": "http.disconnect"}
+
+    sent_messages = []
+
+    async def send(message):
+        sent_messages.append(message)
+
+    await _invoke(app, receive, send, method="POST")
+
+    assert state.get("cancelled") is True
+    assert sent_messages == []
+
+
+@pytest.mark.asyncio
+async def test_asgi_send_failure_terminates(app):
+    # Per the ASGI spec a failure while sending means the response did
+    # not reach the client. The callable must not raise and must not
+    # attempt to write a body afterwards.
+    @app.get("/")
+    async def handler(request):
+        return text("hello")
+
+    async def receive():
+        return {
+            "type": "http.request",
+            "body": b"",
+            "more_body": False,
+        }
+
+    sent_messages = []
+
+    async def send(message):
+        if message["type"] == "http.response.start":
+            raise RuntimeError("client disconnected")
+        sent_messages.append(message)
+
+    await _invoke(app, receive, send)
+
+    assert sent_messages == []
+
+
+@pytest.mark.asyncio
+async def test_asgi_normal_request_response_semantics(app):
+    @app.get("/")
+    async def handler(request):
+        return text("hello")
+
+    async def receive():
+        return {
+            "type": "http.request",
+            "body": b"",
+            "more_body": False,
+        }
+
+    sent_messages = []
+
+    async def send(message):
+        sent_messages.append(message)
+
+    await _invoke(app, receive, send)
+
+    assert sent_messages[0]["type"] == "http.response.start"
+    assert sent_messages[0]["status"] == 200
+    assert sent_messages[-1]["type"] == "http.response.body"
+    assert sent_messages[-1]["body"] == b"hello"
+    assert sent_messages[-1]["more_body"] is False
+
+
+@pytest.mark.asyncio
+async def test_asgi_explicit_http_exception_response_semantics(app):
+    @app.get("/")
+    async def handler(request):
+        raise ServiceUnavailable(message="Service unavailable")
+
+    async def receive():
+        return {
+            "type": "http.request",
+            "body": b"",
+            "more_body": False,
+        }
+
+    sent_messages = []
+
+    async def send(message):
+        sent_messages.append(message)
+
+    await _invoke(app, receive, send)
+
+    assert sent_messages[0]["type"] == "http.response.start"
+    assert sent_messages[0]["status"] == 503
+    assert sent_messages[-1]["more_body"] is False

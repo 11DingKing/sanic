@@ -1,0 +1,1 @@
+Share the client disconnect state across ASGI receive, request stream, handler and response sending; stop waiting for request body data and stop writing responses after an ``http.disconnect``, surfacing ``RequestCancelled`` instead of producing a response that does not match the request state.
