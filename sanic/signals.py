@@ -112,6 +112,26 @@ class SignalWaiter:
         finally:
             self.signal.ctx.waiters.remove(self)
 
+    def resolve(self, context: dict[str, Any]) -> bool:
+        """Resolve the waiter with a signal dispatch context.
+
+        Resolution is a one-shot terminal operation: a waiter is resolved
+        at most once per ``wait`` cycle. A waiter whose future is already
+        in a terminal state (resolved by a previous dispatch that its
+        waiting task has not yet had a chance to clean up, or cancelled,
+        for example by a timeout) is left untouched instead of being
+        triggered again.
+
+        :param context: The context of the signal dispatch
+        :return: ``True`` when this call resolved the waiter, ``False``
+            when the waiter was already in a terminal state
+        """
+        future = self.future
+        if future is None or future.done():
+            return False
+        future.set_result(context)
+        return True
+
     def matches(self, event, condition):
         return (
             (condition is None and not self.exclusive)
@@ -229,38 +249,81 @@ class SignalRouter(BaseRouter):
         signals = group.routes
         if not reverse:
             signals = signals[::-1]
-        try:
-            for signal in signals:
-                for waiter in signal.ctx.waiters:
-                    if waiter.matches(event, condition):
-                        waiter.future.set_result(dict(params))
 
-            for signal in signals:
-                requirements = signal.extra.requirements
-                if (
+        # Resolve waiters first. Each waiter reaches a terminal state at
+        # most once per wait cycle: a waiter finalized by a previous
+        # dispatch but not yet removed, or one that was cancelled (for
+        # example, by an ``event`` timeout), is skipped instead of being
+        # triggered again (which would raise ``InvalidStateError`` and
+        # abort the dispatch before any handler runs).
+        for signal in signals:
+            for waiter in signal.ctx.waiters:
+                if waiter.matches(event, condition):
+                    waiter.resolve(dict(params))
+
+        # Dispatch to the handlers sequentially, in order. Every handler
+        # reaches an independent terminal state: returned, failed, or the
+        # whole dispatch cancelled. A failure in one handler is reported
+        # and recorded, but does not prevent the remaining handlers from
+        # running; cancellation ends the current dispatch immediately.
+        failures: list[Exception] = []
+        for signal in signals:
+            requirements = signal.extra.requirements
+            if not (
+                (
                     (condition is None and signal.ctx.exclusive is False)
                     or (condition is None and not requirements)
                     or (condition == requirements)
-                ) and (signal.ctx.trigger or event == signal.ctx.definition):
-                    maybe_coroutine = signal.handler(**params)
-                    if isawaitable(maybe_coroutine):
-                        retval = await maybe_coroutine
-                        if retval:
-                            return retval
-                    elif maybe_coroutine:
-                        return maybe_coroutine
-            return None
-        except Exception as e:
-            if self.ctx.app.debug and self.ctx.app.state.verbosity >= 1:
-                error_logger.exception(e)
-
-            if event != Event.SERVER_EXCEPTION_REPORT.value:
-                await self.dispatch(
-                    Event.SERVER_EXCEPTION_REPORT.value,
-                    context={"exception": e},
                 )
-                setattr(e, "__dispatched__", True)
-            raise e
+                and (signal.ctx.trigger or event == signal.ctx.definition)
+            ):
+                continue
+
+            try:
+                retval = signal.handler(**params)
+                if isawaitable(retval):
+                    retval = await retval
+            except asyncio.CancelledError:
+                # Cancellation is a terminal state for the current
+                # dispatch: stop immediately and propagate it instead of
+                # reporting it as a handler failure.
+                raise
+            except Exception as e:
+                if self.ctx.app.debug and self.ctx.app.state.verbosity >= 1:
+                    error_logger.exception(e)
+
+                if event != Event.SERVER_EXCEPTION_REPORT.value:
+                    await self.dispatch(
+                        Event.SERVER_EXCEPTION_REPORT.value,
+                        context={"exception": e},
+                    )
+                    setattr(e, "__dispatched__", True)
+                failures.append(e)
+                continue
+
+            # The first truthy return value ends a successful dispatch, as
+            # before. If an earlier handler failed, the dispatch has a
+            # failure terminal state instead and remaining handlers still
+            # run to completion.
+            if retval and not failures:
+                return retval
+
+        if failures:
+            primary = failures[0]
+            if len(failures) > 1:
+                # Every failure was independently reported; keep the rest
+                # reachable without changing the raised exception's type.
+                try:
+                    setattr(
+                        primary,
+                        "__suppressed_exceptions__",
+                        tuple(failures[1:]),
+                    )
+                except AttributeError:
+                    pass
+            raise primary
+
+        return None
 
     async def dispatch(
         self,

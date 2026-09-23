@@ -770,3 +770,231 @@ def test_report_exception_runs_task(app: Sanic):
     app.test_client.get("/")
 
     assert next(c) == 4
+
+
+@pytest.mark.asyncio
+async def test_dispatch_signal_runs_handlers_in_order(app):
+    calls = []
+
+    @app.signal("foo.bar.baz")
+    async def first(**_):
+        calls.append("first")
+
+    @app.signal("foo.bar.baz")
+    async def second(**_):
+        calls.append("second")
+
+    app.signal_router.finalize()
+
+    await app.dispatch("foo.bar.baz", inline=True)
+    assert calls == ["first", "second"]
+
+    await app.dispatch("foo.bar.baz", inline=True, reverse=True)
+    assert calls == ["first", "second", "second", "first"]
+
+
+@pytest.mark.asyncio
+async def test_dispatch_signal_continues_after_handler_exception(app):
+    calls = []
+
+    @app.signal("foo.bar.baz")
+    async def first(**_):
+        calls.append("first")
+        raise ValueError("first failed")
+
+    @app.signal("foo.bar.baz")
+    async def second(**_):
+        calls.append("second")
+
+    @app.signal("foo.bar.baz")
+    async def third(**_):
+        calls.append("third")
+
+    app.signal_router.finalize()
+
+    with pytest.raises(ValueError, match="first failed"):
+        await app.dispatch("foo.bar.baz", inline=True)
+
+    # A failing handler must not swallow the remaining handlers, which are
+    # still executed in order.
+    assert calls == ["first", "second", "third"]
+
+
+@pytest.mark.asyncio
+async def test_dispatch_signal_reports_every_failed_handler(app):
+    calls = []
+    reported = []
+
+    @app.signal(Event.SERVER_EXCEPTION_REPORT)
+    async def report(exception: Exception):
+        reported.append(exception)
+
+    @app.signal("foo.bar.baz")
+    async def first(**_):
+        calls.append("first")
+        raise ValueError("first failed")
+
+    @app.signal("foo.bar.baz")
+    async def second(**_):
+        calls.append("second")
+
+    @app.signal("foo.bar.baz")
+    async def third(**_):
+        calls.append("third")
+        raise RuntimeError("third failed")
+
+    app.signal_router.finalize()
+
+    with pytest.raises(ValueError, match="first failed") as excinfo:
+        await app.dispatch("foo.bar.baz", inline=True)
+
+    assert calls == ["first", "second", "third"]
+
+    # The exception report handlers run as a background task; allow the
+    # loop to drain it.
+    for _ in range(10):
+        await asyncio.sleep(0)
+
+    assert [type(exception) for exception in reported] == [
+        ValueError,
+        RuntimeError,
+    ]
+    assert [str(exception) for exception in reported] == [
+        "first failed",
+        "third failed",
+    ]
+    assert all(
+        getattr(exception, "__dispatched__", False) for exception in reported
+    )
+
+    suppressed = getattr(excinfo.value, "__suppressed_exceptions__", ())
+    assert len(suppressed) == 1
+    assert isinstance(suppressed[0], RuntimeError)
+
+
+@pytest.mark.asyncio
+async def test_dispatch_signal_cancellation_ends_dispatch(app):
+    started = asyncio.Event()
+    ran_after = []
+    reported = []
+
+    @app.signal(Event.SERVER_EXCEPTION_REPORT)
+    async def report(exception: Exception):
+        reported.append(exception)
+
+    @app.signal("foo.bar.baz")
+    async def first(**_):
+        started.set()
+        await asyncio.sleep(3600)
+
+    @app.signal("foo.bar.baz")
+    async def second(**_):
+        ran_after.append(True)
+
+    app.signal_router.finalize()
+
+    dispatch = asyncio.create_task(app.dispatch("foo.bar.baz", inline=True))
+    await started.wait()
+    dispatch.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await dispatch
+
+    await asyncio.sleep(0)
+
+    # Cancellation ends the current dispatch immediately: the remaining
+    # handlers never run and it is not reported as a handler failure.
+    assert not ran_after
+    assert not reported
+
+
+@pytest.mark.asyncio
+async def test_repeated_dispatch_does_not_retrigger_resolved_waiter(app):
+    handler_runs = 0
+
+    @app.signal("foo.bar.baz")
+    async def handler(**_):
+        nonlocal handler_runs
+        handler_runs += 1
+
+    app.signal_router.finalize()
+
+    waiter = asyncio.create_task(app.event("foo.bar.baz"))
+    await asyncio.sleep(0)
+
+    # The inline dispatches do not yield to the waiter task, so after the
+    # first one the resolved waiter is still queued. It must be resolved
+    # once instead of being triggered again (which previously raised
+    # InvalidStateError and aborted the second dispatch).
+    await app.dispatch("foo.bar.baz", inline=True)
+    await app.dispatch("foo.bar.baz", inline=True)
+
+    assert await waiter == {}
+    assert handler_runs == 2
+
+
+@pytest.mark.asyncio
+async def test_dispatch_with_cancelled_waiter_does_not_raise(app):
+    handler_runs = 0
+
+    @app.signal("foo.bar.baz")
+    async def handler(**_):
+        nonlocal handler_runs
+        handler_runs += 1
+
+    app.signal_router.finalize()
+
+    waiter = asyncio.create_task(app.event("foo.bar.baz"))
+    await asyncio.sleep(0)
+
+    # Put the queued waiter into a cancelled terminal state before its
+    # waiting task has removed it.
+    signal = app.signal_router.name_index["foo.bar.baz"]
+    signal.ctx.waiters[0].future.cancel()
+
+    # The stale, cancelled waiter is ignored instead of aborting the
+    # dispatch with InvalidStateError.
+    await app.dispatch("foo.bar.baz", inline=True)
+
+    with pytest.raises(asyncio.CancelledError):
+        await waiter
+
+    assert handler_runs == 1
+
+
+@pytest.mark.asyncio
+async def test_waiter_can_wait_again_after_dispatch(app):
+    @app.signal("foo.bar.baz")
+    async def handler(**_): ...
+
+    app.signal_router.finalize()
+
+    for context in ({}, {"amount": 1}):
+        waiter = asyncio.create_task(app.event("foo.bar.baz"))
+        await asyncio.sleep(0)
+        await app.dispatch("foo.bar.baz", inline=True, context=dict(context))
+        assert await waiter == context
+
+
+@pytest.mark.asyncio
+async def test_dispatch_signal_reverse_continues_after_failure(app):
+    # Mirrors the shutdown lifecycle, which dispatches in reverse: a
+    # failing cleanup listener must not prevent the remaining cleanup
+    # listeners from running, while the failure still propagates.
+    calls = []
+
+    @app.signal("foo.bar.baz", priority=0)
+    async def failing(**_):
+        calls.append("failing")
+        raise ValueError("cleanup failed")
+
+    @app.signal("foo.bar.baz", priority=1)
+    async def cleanup(**_):
+        calls.append("cleanup")
+
+    app.signal_router.finalize()
+
+    with pytest.raises(ValueError, match="cleanup failed"):
+        await app.dispatch("foo.bar.baz", inline=True, reverse=True)
+
+    assert calls == ["failing", "cleanup"]
